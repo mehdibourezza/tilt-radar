@@ -22,6 +22,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from data.riot.client import RiotClient
 from data.db.repository import PlayerRepository
 from ml.inference.engine import TiltInferenceEngine
+from ml.features.feature_extractor import FeatureExtractor
+from ml.features.snapshot_buffer import SnapshotBuffer
 from api.dependencies.db import get_db_session
 from workers.tasks import ingest_player
 
@@ -117,7 +119,9 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
     await websocket.accept()
     logger.info(f"Agent connected for {summoner}#{tag}")
 
-    engine = TiltInferenceEngine()
+    engine    = TiltInferenceEngine()
+    extractor = FeatureExtractor()
+    buffer    = SnapshotBuffer(max_len=6)
 
     try:
         async with RiotClient() as riot:
@@ -213,7 +217,8 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
             })
 
             # Step 4 — main loop: receive snapshots, score, track peaks
-            # peak_scores: {summoner_name → {score, tilt_type, signals, champion}}
+            # peak_scores: {summoner_name → {score, tilt_type, signals, champion, role,
+            #                                game_time_at_peak, feature_vector}}
             peak_scores: dict[str, dict] = {}
             # Retained for post-game report: last full snapshot + item sell timeline
             backend_last_snapshot: dict | None = None
@@ -242,6 +247,9 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                         peer_baselines,
                     )
 
+                    # Reset snapshot buffer for next game session
+                    buffer.clear()
+
                     # Queue async ingestion for self + all others
                     ingest_player.delay(puuid, platform="euw1")
                     for ep in non_self_puuids:
@@ -258,7 +266,37 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                     logger.info(f"DEBUG names in players list: {player_names}")
                     logger.info(f"DEBUG kill event names (sample): {sample}")
 
-                report = engine.score(snapshot, personal_baselines, peer_baselines)
+                report    = engine.score(snapshot, personal_baselines, peer_baselines)
+                game_time = snapshot.get("game_time", 0)
+                all_players = snapshot.get("players", [])
+                kill_events = [e for e in snapshot.get("events", []) if e.get("type") == "ChampionKill"]
+
+                # ── Feature extraction (Phase A ML pipeline) ──────────────────
+                # Update buffer first so history is available for delta features.
+                # Then extract the feature vector for each player.
+                for player in all_players:
+                    buffer.update(game_time, player)
+
+                player_features: dict[str, list[float]] = {}
+                for player in all_players:
+                    pname     = player.get("summonerName", "")
+                    puuid_key = player.get("puuid")
+                    personal  = personal_baselines.get(puuid_key) or personal_baselines.get(pname)
+                    peer      = peer_baselines.get(puuid_key) or peer_baselines.get(pname)
+                    history   = buffer.get_history(pname)
+                    try:
+                        fv = extractor.extract(
+                            player=player,
+                            game_time=game_time,
+                            kill_events=kill_events,
+                            all_players=all_players,
+                            personal_baseline=personal,
+                            peer_baseline=peer,
+                            history=history,
+                        )
+                        player_features[pname] = fv.to_list()
+                    except Exception as exc:
+                        logger.warning(f"Feature extraction failed for {pname}: {exc}")
 
                 # Log a compact score summary every snapshot so we can debug in real time
                 game_fmt = report.get("game_time_fmt", "?")
@@ -272,17 +310,25 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                 else:
                     logger.info(f"[{game_fmt}] All scores 0.00 — no signals triggered")
 
-                # Update peak tilt scores from this report
+                # Update peak tilt scores — now also captures role, game_time, feature_vector
                 for player_result in report.get("players", []):
-                    name = player_result["summonerName"]
+                    name  = player_result["summonerName"]
                     score = player_result["tilt_score"]
                     if score > peak_scores.get(name, {}).get("score", 0.0):
+                        # Find position from the raw player dict
+                        raw_player = next(
+                            (p for p in all_players if p.get("summonerName") == name), {}
+                        )
                         peak_scores[name] = {
-                            "score": score,
-                            "tilt_type": player_result["tilt_type"],
-                            "signals": player_result["key_signals"],
-                            "champion": player_result["championName"],
-                            "player_type": player_result["player_type"],
+                            "score":            score,
+                            "tilt_type":        player_result["tilt_type"],
+                            "signals":          player_result["key_signals"],
+                            "champion":         player_result["championName"],
+                            "player_type":      player_result["player_type"],
+                            "role":             raw_player.get("position", ""),
+                            "game_time_at_peak": game_time,
+                            "feature_vector":   player_features.get(name),
+                            "n_signals_active": len(player_result["key_signals"]),
                         }
 
                 await websocket.send_json(report)
@@ -342,6 +388,11 @@ async def _run_post_game_evaluation(
             game_duration_min=game_duration_min,
             peer_baseline=peer,
         )
+        # Attach ML pipeline columns captured during the game
+        entry["role"]                 = peak.get("role", "")
+        entry["game_time_at_peak"]    = peak.get("game_time_at_peak")
+        entry["feature_vector_at_peak"] = peak.get("feature_vector")
+        entry["n_signals_active"]     = peak.get("n_signals_active", 0)
         entries.append(entry)
 
     if not entries:

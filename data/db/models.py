@@ -274,4 +274,15 @@ class TiltPredictionLog(Base):
     performed_poorly: Mapped[bool] = mapped_column(Boolean)   # final stats confirm tilt
     verdict: Mapped[str] = mapped_column(String(16))          # true_positive | false_positive | true_negative | false_negative
 
+    # ── ML pipeline columns (Phase A migration) ───────────────────────────────
+    # role: player position during the game (needed for role-aware feature normalization)
+    role: Mapped[str | None] = mapped_column(String(16))
+    # game_time_at_peak: seconds into the game when peak tilt score was reached
+    game_time_at_peak: Mapped[float | None] = mapped_column(Float)
+    # feature_vector_at_peak: 27-dim FeatureExtractor output at the peak tilt moment
+    # Stored as JSON list — directly loadable as np.array for XGBoost / GRU training
+    feature_vector_at_peak: Mapped[list | None] = mapped_column(JSON)
+    # n_signals_active: number of signals active at peak (convenience column for queries)
+    n_signals_active: Mapped[int | None] = mapped_column(Integer)
+
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

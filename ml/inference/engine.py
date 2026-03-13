@@ -181,6 +181,7 @@ class TiltInferenceEngine:
                 player, kill_events, game_time, active_baseline,
                 is_peer=(personal is None and peer is not None),
                 all_players=players,
+                all_events=events,
             )
 
             tilt_score = min(1.0, sum(signal_weights.values()))
@@ -211,6 +212,40 @@ class TiltInferenceEngine:
             "enemies": enemy_results,
         }
 
+    @staticmethod
+    def _is_productive_death(
+        death_time: float,
+        dead_team: str,
+        all_events: list,
+        name_to_team: dict,
+        window: float = 30.0,
+    ) -> bool:
+        """
+        Returns True if a death generated value for the dead player's team within `window` seconds.
+
+        A death is productive if shortly after it, the dead player's team:
+          - Got a champion kill (trade / dive)
+          - Killed a turret (cross-map play)
+          - Secured an objective (drake, baron, herald, inhibitor)
+
+        This prevents penalizing dives, sacrifices, and cross-map rotations.
+        Example: top laner dives and dies, team takes bot turret + double kill → productive.
+        """
+        productive_types = {
+            "ChampionKill", "TurretKilled", "DragonKill",
+            "BaronKill", "RiftHeraldKill", "InhibKilled",
+        }
+        for event in all_events:
+            t = event.get("time", 0)
+            if not (death_time < t <= death_time + window):
+                continue
+            if event.get("type") not in productive_types:
+                continue
+            killer = event.get("killer", "").lower()
+            if name_to_team.get(killer) == dead_team:
+                return True
+        return False
+
     def _extract_signals(
         self,
         enemy: dict,
@@ -219,6 +254,7 @@ class TiltInferenceEngine:
         baseline,           # PlayerBaseline or PeerGroupBaseline ORM object or None
         is_peer: bool = False,
         all_players: list[dict] | None = None,
+        all_events: list[dict] | None = None,
     ) -> tuple[list[str], dict[str, float]]:
         """Extract tilt signals for one enemy. Returns (signal names, weighted scores)."""
         name = enemy.get("summonerName", "")
@@ -226,18 +262,34 @@ class TiltInferenceEngine:
         position = enemy.get("position", "").upper()
         is_support = position == "UTILITY"
         is_jungle  = position == "JUNGLE"
+        dead_team  = enemy.get("team", "")
 
         signals = []
         weights = {}
+        _all_events = all_events or []
 
         # Kill events use game name only (no #tag), but summonerName includes the tag.
         # Strip the tag for event comparisons: "Fenixazz#AXIS" → "Fenixazz"
         name_for_events = name.split("#")[0]
 
+        # Build tag-stripped name → team lookup for productive death checks.
+        name_to_team: dict[str, str] = {
+            p.get("summonerName", "").split("#")[0].lower(): p.get("team", "")
+            for p in (all_players or [])
+        }
+
+        def _productive(e: dict) -> bool:
+            return self._is_productive_death(
+                e.get("time", 0), dead_team, _all_events, name_to_team
+            )
+
         # --- Signal 1: Repeat deaths to the same enemy (pride-tilt) ---
+        # Productive deaths (trade/dive that got team value) are excluded — dying to the
+        # same person 3 times while enabling cross-map plays is not pride, it's strategy.
         death_sources = [
             e.get("killer") for e in kill_events
             if e.get("victim", "").lower() == name_for_events.lower()
+            and not _productive(e)
         ]
         if death_sources:
             from collections import Counter
@@ -250,19 +302,21 @@ class TiltInferenceEngine:
                 weights["repeat_deaths_same_enemy"] = self.WEIGHTS["repeat_deaths_same_enemy"] * 0.5
 
         # --- Signal 2: Death acceleration ---
-        # Compare deaths in first half vs second half of game so far.
+        # Compare unproductive deaths in first half vs second half of game so far.
         # Requires late deaths to exceed early by at least 2 (not just 1) to avoid noise.
-        if game_time > 600:  # at least 10 minutes of data
+        if game_time > 600:
             midpoint = game_time / 2
             early_deaths = sum(
                 1 for e in kill_events
                 if e.get("victim", "").lower() == name_for_events.lower()
                 and e.get("time", 0) < midpoint
+                and not _productive(e)
             )
             late_deaths = sum(
                 1 for e in kill_events
                 if e.get("victim", "").lower() == name_for_events.lower()
                 and e.get("time", 0) >= midpoint
+                and not _productive(e)
             )
             if late_deaths >= 3 and late_deaths > early_deaths + 2:
                 signals.append("death_rate_accelerating")
@@ -291,13 +345,15 @@ class TiltInferenceEngine:
                     signals.append(f"cs_down_{drop_pct}pct_{label_suffix}")
                     weights["cs_drop_vs_baseline"] = self.WEIGHTS["cs_drop_vs_baseline"]
 
-        # --- Signal 4: Early death cluster (4+ deaths before 10 min) ---
+        # --- Signal 4: Early death cluster (4+ unproductive deaths before 10 min) ---
         # Raised from 3 to 4: 3 deaths in 10 min can happen to a support or jungler in a bad
         # but non-tilted game. 4+ is a clearer sign of something wrong.
+        # Productive deaths (dives, trades) are excluded.
         early_deaths_count = sum(
             1 for e in kill_events
             if e.get("victim", "").lower() == name_for_events.lower()
             and e.get("time", 0) < 600
+            and not _productive(e)
         )
         if early_deaths_count >= 4:
             signals.append(f"{early_deaths_count}_deaths_before_10min")
@@ -392,9 +448,12 @@ class TiltInferenceEngine:
         # LoL respawn timer grows with game time: roughly 7s at 0 min → 50s at 35 min.
         # If a player is spending an escalating share of game time dead, it signals
         # desperate overplaying or giving up (dying on purpose to end faster).
+        # Only count unproductive deaths for respawn time calculations —
+        # a player who died diving for a baron shouldn't be penalised for "time spent dead".
         player_death_times = [
             e.get("time", 0.0) for e in kill_events
             if e.get("victim", "").lower() == name_for_events.lower()
+            and not _productive(e)
         ]
         if player_death_times and game_time > 600:
             def _est_respawn(t: float) -> float:
