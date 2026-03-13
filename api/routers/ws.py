@@ -24,6 +24,7 @@ from data.db.repository import PlayerRepository
 from ml.inference.engine import TiltInferenceEngine
 from ml.features.feature_extractor import FeatureExtractor
 from ml.features.snapshot_buffer import SnapshotBuffer
+from ml.features.game_sequence_recorder import GameSequenceRecorder
 from api.dependencies.db import get_db_session
 from workers.tasks import ingest_player
 
@@ -220,6 +221,9 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
             # peak_scores: {summoner_name → {score, tilt_type, signals, champion, role,
             #                                game_time_at_peak, feature_vector}}
             peak_scores: dict[str, dict] = {}
+            # recorders: accumulate full game feature vector trajectory per player
+            # for GRU training data (saved to snapshot_sequence at game_over)
+            recorders: dict[str, GameSequenceRecorder] = {}
             # Retained for post-game report: last full snapshot + item sell timeline
             backend_last_snapshot: dict | None = None
             item_sell_timeline: dict[str, list] = {}   # {summoner → [{time, items}]}
@@ -242,9 +246,17 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                     await websocket.send_json(post_game_report)
                     logger.info("Post-game report sent to agent.")
 
+                    # Serialize full game trajectories before clearing recorders
+                    snapshot_sequences = {
+                        name: seq
+                        for name, rec in recorders.items()
+                        if (seq := rec.to_json()) is not None
+                    }
+                    recorders.clear()
+
                     await _run_post_game_evaluation(
                         peak_scores, final_players, game_duration_min,
-                        peer_baselines,
+                        peer_baselines, snapshot_sequences,
                     )
 
                     # Reset snapshot buffer for next game session
@@ -295,6 +307,10 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                             history=history,
                         )
                         player_features[pname] = fv.to_list()
+                        # Accumulate full game trajectory for GRU training
+                        recorders.setdefault(
+                            pname, GameSequenceRecorder(player_name=pname)
+                        ).record(fv.vector, game_time)
                     except Exception as exc:
                         logger.warning(f"Feature extraction failed for {pname}: {exc}")
 
@@ -355,6 +371,7 @@ async def _run_post_game_evaluation(
     final_players: list[dict],
     game_duration_min: float,
     peer_baselines: dict,
+    snapshot_sequences: dict | None = None,
 ):
     """
     Compare tilt predictions against final scoreboard.
@@ -389,10 +406,11 @@ async def _run_post_game_evaluation(
             peer_baseline=peer,
         )
         # Attach ML pipeline columns captured during the game
-        entry["role"]                 = peak.get("role", "")
-        entry["game_time_at_peak"]    = peak.get("game_time_at_peak")
+        entry["role"]                   = peak.get("role", "")
+        entry["game_time_at_peak"]      = peak.get("game_time_at_peak")
         entry["feature_vector_at_peak"] = peak.get("feature_vector")
-        entry["n_signals_active"]     = peak.get("n_signals_active", 0)
+        entry["n_signals_active"]       = peak.get("n_signals_active", 0)
+        entry["snapshot_sequence"]      = (snapshot_sequences or {}).get(summoner_name)
         entries.append(entry)
 
     if not entries:

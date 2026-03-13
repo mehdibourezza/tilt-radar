@@ -205,27 +205,44 @@ class TemporalTiltModel:
 
     def train(
         self,
-        sequences: list[np.ndarray],
-        labels:    list[int],
-        val_sequences: list[np.ndarray] | None = None,
-        val_labels:    list[int]        | None = None,
+        sequences:       list[np.ndarray],
+        label_sequences: list[np.ndarray],
+        val_sequences:       list[np.ndarray] | None = None,
+        val_label_sequences: list[np.ndarray] | None = None,
     ) -> dict[str, list[float]]:
         """
-        Train the GRU model on a list of per-player game sequences.
+        Train the GRU model on a list of per-player game sequences using
+        per-timestep ramp labels (Option B temporal labeling).
 
         Args:
-            sequences: list of np.ndarray, each shape (T_i, FEATURE_DIM) — variable length.
-                       T_i is the number of snapshots in game i.
-            labels:    list of int (0 or 1) — one per game sequence.
-            val_sequences: optional validation sequences
-            val_labels:    optional validation labels
+            sequences:       list of np.ndarray, each shape (T_i, FEATURE_DIM).
+            label_sequences: list of np.ndarray, each shape (T_i,) with values in
+                             [0.0, 1.0]. These are ramp labels: 0.0 before tilt
+                             builds up, ramping to 1.0 around game_time_at_peak.
+                             Produced by dataset.build_sequence_dataset().
+            val_sequences:       optional validation sequences
+            val_label_sequences: optional validation label sequences
 
         Returns:
             dict with "train_loss" and "val_loss" histories (list per epoch)
+
+        === WHY PER-TIMESTEP LABELS? ===
+
+        Last-state supervision (old approach): the loss is computed only on the
+        FINAL snapshot. This means the GRU learns nothing from the trajectory —
+        it could ignore all but the last step and still minimize loss.
+
+        Per-timestep loss with ramp labels: the loss is computed on EVERY snapshot.
+        At minute 1 the model should predict ~0. At the peak it should predict 1.0.
+        This forces the GRU to actually learn temporal dynamics instead of
+        treating the whole game as a single prediction at the end.
+
+        The ramp (not a hard 0/1 step) is intentional: we don't know the exact
+        moment tilt *started*, only when it *peaked*. The ramp is an honest
+        encoding of that uncertainty.
         """
         import torch
         import torch.nn as nn
-        from torch.utils.data import DataLoader
 
         self._model = TiltGRU(
             input_dim=FEATURE_DIM,
@@ -243,44 +260,51 @@ class TemporalTiltModel:
             optimizer, mode="min", factor=0.5, patience=5,
         )
 
-        # Compute class weight for imbalanced data
-        pos_rate = sum(labels) / max(len(labels), 1)
-        pos_weight = torch.tensor([(1 - pos_rate) / max(pos_rate, 1e-9)],
-                                  dtype=torch.float32, device=self._device)
+        # pos_weight from mean label value across all timesteps of all sequences
+        all_labels = np.concatenate(label_sequences)
+        pos_rate   = float(all_labels.mean())
+        pos_weight = torch.tensor(
+            [(1 - pos_rate) / max(pos_rate, 1e-9)],
+            dtype=torch.float32, device=self._device,
+        )
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+        n_tilt = sum(1 for lbl in label_sequences if lbl[-1] > 0.5)
         history: dict[str, list[float]] = {"train_loss": [], "val_loss": []}
-        best_val_loss = float("inf")
-        best_state    = None
+        best_val_loss    = float("inf")
+        best_state       = None
         patience_counter = 0
 
         n_epochs = self.hp["epochs"]
         logger.info(
             f"Training TiltGRU on {len(sequences)} sequences "
-            f"({sum(labels)} positive, {pos_rate:.1%} base rate), "
-            f"device={self._device}"
+            f"({n_tilt} tilt, pos_rate={pos_rate:.1%}), "
+            f"device={self._device}, using per-timestep ramp labels"
         )
 
         for epoch in range(n_epochs):
             self._model.train()
             epoch_loss = 0.0
 
-            # Shuffle training data (simple random permutation — no DataLoader needed
-            # for variable-length sequences which we process one at a time)
-            indices = np.random.permutation(len(sequences))
+            indices    = np.random.permutation(len(sequences))
             optimizer.zero_grad()
-            batch_loss = torch.tensor(0.0, device=self._device)
+            batch_loss  = torch.tensor(0.0, device=self._device)
             batch_count = 0
 
             for i, idx in enumerate(indices):
                 seq = torch.tensor(sequences[idx], dtype=torch.float32, device=self._device)
                 seq = seq.unsqueeze(0)   # (1, T, FEATURE_DIM)
-                y   = torch.tensor([[labels[idx]]], dtype=torch.float32, device=self._device)
 
-                out, _ = self._model(seq)  # (1, T, 1)
-                # Use LAST timestep for classification loss
-                logit = _sigmoid_to_logit(out[0, -1, 0].unsqueeze(0).unsqueeze(0))
-                loss  = criterion(logit, y)
+                # Ramp label for every timestep: shape (T,)
+                y_ramp = torch.tensor(
+                    label_sequences[idx], dtype=torch.float32, device=self._device
+                )
+
+                out, _ = self._model(seq)          # (1, T, 1)
+                logits  = _sigmoid_to_logit(out[0, :, 0])  # (T,)
+                # Loss averaged over all T timesteps in this sequence
+                loss = criterion(logits, y_ramp)
+
                 batch_loss  = batch_loss + loss
                 batch_count += 1
                 epoch_loss  += loss.item()
@@ -299,8 +323,8 @@ class TemporalTiltModel:
 
             # ── Validation ───────────────────────────────────────────────────
             val_loss = None
-            if val_sequences is not None and val_labels is not None:
-                val_loss = self._eval_loss(val_sequences, val_labels, criterion)
+            if val_sequences is not None and val_label_sequences is not None:
+                val_loss = self._eval_loss(val_sequences, val_label_sequences, criterion)
                 history["val_loss"].append(round(val_loss, 5))
                 scheduler.step(val_loss)
 
@@ -417,18 +441,19 @@ class TemporalTiltModel:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _eval_loss(self, sequences, labels, criterion) -> float:
+    def _eval_loss(self, sequences, label_sequences, criterion) -> float:
+        """Compute mean per-sequence loss using per-timestep ramp labels."""
         import torch
 
         self._model.eval()
         total_loss = 0.0
         with torch.no_grad():
-            for seq, label in zip(sequences, labels):
-                x = torch.tensor(seq, dtype=torch.float32, device=self._device).unsqueeze(0)
-                y = torch.tensor([[label]], dtype=torch.float32, device=self._device)
+            for seq, lbl in zip(sequences, label_sequences):
+                x      = torch.tensor(seq, dtype=torch.float32, device=self._device).unsqueeze(0)
+                y_ramp = torch.tensor(lbl, dtype=torch.float32, device=self._device)
                 out, _ = self._model(x)
-                logit  = _sigmoid_to_logit(out[0, -1, 0].unsqueeze(0).unsqueeze(0))
-                total_loss += criterion(logit, y).item()
+                logits = _sigmoid_to_logit(out[0, :, 0])
+                total_loss += criterion(logits, y_ramp).item()
         self._model.train()
         return total_loss / max(len(sequences), 1)
 

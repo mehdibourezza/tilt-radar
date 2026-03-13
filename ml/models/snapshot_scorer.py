@@ -115,6 +115,8 @@ class SnapshotScorer:
         y_train: np.ndarray,
         X_val: np.ndarray | None = None,
         y_val:  np.ndarray | None = None,
+        X_cal:  np.ndarray | None = None,
+        y_cal:  np.ndarray | None = None,
     ) -> dict[str, float]:
         """
         Train the XGBoost model + Platt scaling calibrator.
@@ -124,6 +126,9 @@ class SnapshotScorer:
             y_train: shape (n_train,) — binary labels (1 = performed poorly)
             X_val:   shape (n_val, FEATURE_DIM) — validation set (optional)
             y_val:   shape (n_val,) — validation labels (optional)
+            X_cal:   shape (n_cal, FEATURE_DIM) — calibration set for Platt scaling.
+                     Should be DIFFERENT from X_val (which is used for early stopping).
+                     If None, falls back to X_val, then X_train (less ideal).
 
         Returns:
             dict with training metrics: {"train_logloss", "val_logloss" (if val provided)}
@@ -155,14 +160,27 @@ class SnapshotScorer:
         )
 
         # ── Platt scaling calibration ─────────────────────────────────────────
-        # Fit a logistic regression on the raw XGBoost probabilities vs true labels
-        # using a held-out calibration set (val if available, else train — less ideal)
+        # IMPORTANT: use a SEPARATE calibration set, NOT the val set used for
+        # early stopping. Using the same set for both early stopping and
+        # calibration creates a subtle data leakage: the model's n_estimators
+        # was chosen to minimize val loss, so the val set is not an unbiased
+        # estimate of raw probability quality. A separate cal set is unbiased.
         from sklearn.linear_model import LogisticRegression
 
-        cal_X = X_val if X_val is not None else X_train
-        cal_y = y_val if y_val is not None else y_train
-        raw_proba = self._model.predict_proba(cal_X)[:, 1].reshape(-1, 1)
+        if X_cal is not None and y_cal is not None:
+            cal_X, cal_y = X_cal, y_cal
+            logger.info(f"Platt scaling on dedicated calibration set ({len(cal_y)} samples)")
+        elif X_val is not None and y_val is not None:
+            cal_X, cal_y = X_val, y_val
+            logger.warning(
+                "Platt scaling is using the val set (same set used for early stopping). "
+                "Pass X_cal/y_cal for an unbiased calibration set."
+            )
+        else:
+            cal_X, cal_y = X_train, y_train
+            logger.warning("Platt scaling on training set — calibration will be overconfident.")
 
+        raw_proba = self._model.predict_proba(cal_X)[:, 1].reshape(-1, 1)
         self._calibrator = LogisticRegression(C=10.0, solver="lbfgs")
         self._calibrator.fit(raw_proba, cal_y)
         logger.info("Platt scaling calibrator fitted.")

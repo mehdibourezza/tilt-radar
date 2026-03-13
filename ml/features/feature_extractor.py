@@ -8,16 +8,17 @@ This is the bridge between the raw game data and all downstream models:
   - XGBoost snapshot scorer  (ml/models/snapshot_scorer.py)
   - GRU temporal model       (ml/models/temporal_model.py)
 
-=== FEATURE VECTOR: 27 DIMENSIONS ===
+=== FEATURE VECTOR: 26 DIMENSIONS ===
 
 Group 1 — Baseline-normalized performance (4)
   Positive values = performing WORSE than baseline. Clipped to [-3, 3].
   Convention: z = (expected - actual) / IQR  for metrics where lower = worse (CS, gold)
               z = (actual - expected) / IQR  for metrics where higher = worse (deaths)
 
-Group 2 — Raw behavioral signals (12)
-  Binary flags or continuous [0, 1] encodings of the 12 engine signals.
+Group 2 — Raw behavioral signals (11)
+  Binary flags or continuous [0, 1] encodings of the engine signals.
   These are NOT z-scored — they are the normalized signal magnitudes.
+  Note: cs_drop_flag was removed (redundant with cs_z from Group 1).
 
 Group 3 — Temporal delta features (4)
   Change from the previous snapshot. Requires ≥2 snapshots; defaults to 0.0.
@@ -62,10 +63,9 @@ FEATURE_NAMES: list[str] = [
     "kp_z",           # Kill participation deficit vs baseline, in IQR units.
     "death_z",        # Death rate excess vs baseline, in IQR units.
 
-    # ── Group 2: Raw behavioral signals (12) ──────────────────────────────────
+    # ── Group 2: Raw behavioral signals (11) ──────────────────────────────────
     "repeat_deaths_norm",       # Deaths to same enemy / 5.0  (0 → 1+)
     "death_accel_flag",         # 1.0 if late deaths ≥3 AND > early + 2, else 0.0
-    "cs_drop_flag",             # 1.0 if cs_z > 1.5 AND game > 7 min AND not support
     "early_death_cluster_norm", # Unproductive deaths before 10 min / 6.0
     "kp_drop_relative",         # (kp_early − kp_late) / kp_early, clamped [0, 1]
     "vision_per_min",           # Ward score / game_time_min  (raw — small value = bad)
@@ -73,7 +73,7 @@ FEATURE_NAMES: list[str] = [
     "sold_items_norm",          # Items sold count / 4.0, capped at 1.0
     "level_deficit_norm",       # max(0, avg_level − player_level) / 5.0
     "gold_deficit_ratio",       # max(0, 1 − estimated_gold / expected_gold)  [0, 1]
-    "wrong_build_flag",         # 1.0 if no signature items after 15 min with ≥2 items
+    "build_distance",           # Continuous [0, 1]: fraction of expected items MISSING
     "dead_time_pct",            # Estimated dead time / game_time  [0, 1]
 
     # ── Group 3: Temporal delta features (4) ──────────────────────────────────
@@ -96,7 +96,7 @@ FEATURE_NAMES: list[str] = [
 ]
 
 FEATURE_DIM: int = len(FEATURE_NAMES)
-assert FEATURE_DIM == 27, f"Expected 27 features, got {FEATURE_DIM}"
+assert FEATURE_DIM == 26, f"Expected 26 features, got {FEATURE_DIM}"
 
 
 # ── Output type ───────────────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ _DEFAULT_GOLD_IQR  = 55.0   # Gold per minute
 
 class FeatureExtractor:
     """
-    Extracts a normalized 27-dimensional feature vector from one player in one snapshot.
+    Extracts a normalized 26-dimensional feature vector from one player in one snapshot.
 
     Instantiate once, call .extract() for every (player, snapshot) pair.
 
@@ -153,6 +153,14 @@ class FeatureExtractor:
     Returns:
         FeatureVector — always valid (no NaN, no KeyError)
     """
+
+    def __init__(self, item_registry=None) -> None:
+        """
+        Args:
+            item_registry: Optional ItemRegistry for patch-aware build distance computation.
+                           If None, falls back to CHAMPION_SIGNATURE_ITEMS (hardcoded IDs).
+        """
+        self._item_registry = item_registry
 
     def extract(
         self,
@@ -262,9 +270,6 @@ class FeatureExtractor:
             early_d, late_d  = 0, 0
             death_accel_flag = 0.0
 
-        # ── Group 2c: CS drop flag (binary threshold on cs_z) ────────────────
-        cs_drop_flag = 1.0 if (not is_support and cs_z > 1.5 and game_time > 420) else 0.0
-
         # ── Group 2d: Early death cluster ────────────────────────────────────
         early_deaths = sum(
             1 for e in kill_events
@@ -313,13 +318,25 @@ class FeatureExtractor:
         else:
             gold_deficit_ratio = 0.0
 
-        # ── Group 2k: Wrong build flag ────────────────────────────────────────
-        expected_items = CHAMPION_SIGNATURE_ITEMS.get(champion, set())
-        current_items  = set(player.get("items", []))
-        if expected_items and game_time > 900 and len(current_items) >= 2:
-            wrong_build_flag = 0.0 if (current_items & expected_items) else 1.0
+        # ── Group 2k: Build distance ──────────────────────────────────────────
+        # Continuous [0, 1]: 0 = has all expected items, 1 = has none.
+        # Uses ItemRegistry (empirical, patch-aware) when available;
+        # falls back to CHAMPION_SIGNATURE_ITEMS (hardcoded item IDs).
+        if self._item_registry is not None and game_time > 900:
+            current_item_names = player.get("item_names", [])
+            build_distance = self._item_registry.build_distance(
+                champion, position, current_item_names
+            )
+        elif game_time > 900:
+            expected_items = CHAMPION_SIGNATURE_ITEMS.get(champion, set())
+            current_items  = set(player.get("items", []))
+            if expected_items and len(current_items) >= 2:
+                matched = len(current_items & expected_items)
+                build_distance = 1.0 - (matched / len(expected_items))
+            else:
+                build_distance = 0.0
         else:
-            wrong_build_flag = 0.0
+            build_distance = 0.0
 
         # ── Group 2l: Dead time percentage ───────────────────────────────────
         death_times = [
@@ -371,9 +388,9 @@ class FeatureExtractor:
         # ── Assemble ──────────────────────────────────────────────────────────
         vector = np.array([
             cs_z, gold_z, kp_z, death_z,
-            repeat_deaths_norm, death_accel_flag, cs_drop_flag, early_death_cluster_norm,
+            repeat_deaths_norm, death_accel_flag, early_death_cluster_norm,
             kp_drop_relative, vision_per_min, obj_absence_rate, sold_items_norm,
-            level_deficit_norm, gold_deficit_ratio, wrong_build_flag, dead_time_pct,
+            level_deficit_norm, gold_deficit_ratio, build_distance, dead_time_pct,
             delta_cs_per_min, delta_death_rate, death_velocity_5min, kp_trend,
             game_time_norm, role_support, role_jungle, role_top, role_mid,
             has_personal_baseline, chronic_slump,

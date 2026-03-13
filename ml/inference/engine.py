@@ -120,6 +120,10 @@ class TiltInferenceEngine:
       - Objective desperation (contesting when behind)
 
     Each signal contributes a weighted score. Final score is clipped to [0, 1].
+
+    Wrong build signal uses ItemRegistry (empirical, patch-aware) when available,
+    falls back to hardcoded CHAMPION_SIGNATURE_ITEMS otherwise.
+    Pass item_registry=ItemRegistry.load(...) to the constructor to enable it.
     """
 
     # Signal weights — tuned heuristically, will be learned by the ML model later
@@ -138,6 +142,14 @@ class TiltInferenceEngine:
         "wrong_build":              0.25,
         "respawn_timer_trend":      0.20,
     }
+
+    def __init__(self, item_registry=None) -> None:
+        """
+        Args:
+            item_registry: Optional ItemRegistry instance for patch-aware wrong build
+                           detection. If None, falls back to CHAMPION_SIGNATURE_ITEMS.
+        """
+        self._item_registry = item_registry
 
     def score(self, snapshot: dict, personal_baselines: dict, peer_baselines: dict = None) -> dict:
         """
@@ -230,6 +242,16 @@ class TiltInferenceEngine:
 
         This prevents penalizing dives, sacrifices, and cross-map rotations.
         Example: top laner dives and dies, team takes bot turret + double kill → productive.
+
+        # TODO (flaw 5): The productive death filter currently can't distinguish
+        # 1v1 deaths from 1v2/1v3 deaths. A 1v1 death is NEVER productive.
+        # A 1v2 or 1v3 death that leads to a cross-map objective within ~15s IS productive.
+        # Fix requires: tracking participant counts at each kill event using the event
+        # timeline + champion position data. The Riot Live Client Data API does not
+        # expose participant counts directly — this requires position inference from
+        # the allGameData endpoint and cross-referencing with kill events.
+        # Until implemented, all deaths to the same enemy count against the player
+        # regardless of how many enemies were present.
         """
         productive_types = {
             "ChampionKill", "TurretKilled", "DragonKill",
@@ -432,16 +454,29 @@ class TiltInferenceEngine:
                     weights["gold_deficit_per_role"] = self.WEIGHTS["gold_deficit_per_role"]
 
         # --- Signal 11: Wrong build ---
-        # If a player has NONE of their champion's signature items after 15 min with ≥2 items built,
+        # If a player has NONE of their champion's expected items after 15 min with ≥2 items built,
         # they are either trolling, panicking, or improvising under stress.
+        # Uses empirical ItemRegistry (patch-aware) if available; falls back to hardcoded map.
         champion_name = enemy.get("championName", "")
-        expected_items = CHAMPION_SIGNATURE_ITEMS.get(champion_name, set())
-        if expected_items and game_time > 900:
+        position      = enemy.get("position", "")
+        if game_time > 900:
             current_item_set = set(enemy.get("items", []))
-            has_core = bool(current_item_set & expected_items)
-            if not has_core and len(current_item_set) >= 2:
-                signals.append(f"wrong_build_{champion_name.lower().replace(' ', '_')}")
-                weights["wrong_build"] = self.WEIGHTS["wrong_build"]
+            if len(current_item_set) >= 2:
+                wrong = False
+                if self._item_registry is not None:
+                    # Empirical path: item names from registry
+                    current_item_names = enemy.get("item_names", [])
+                    wrong = self._item_registry.is_wrong_build(
+                        champion_name, position, current_item_names
+                    )
+                else:
+                    # Fallback: hardcoded item ID set
+                    expected_items = CHAMPION_SIGNATURE_ITEMS.get(champion_name, set())
+                    wrong = bool(expected_items) and not bool(current_item_set & expected_items)
+
+                if wrong:
+                    signals.append(f"wrong_build_{champion_name.lower().replace(' ', '_')}")
+                    weights["wrong_build"] = self.WEIGHTS["wrong_build"]
 
         # --- Signal 12: Respawn timer trend ---
         # Estimate total time spent dead from death event timestamps.

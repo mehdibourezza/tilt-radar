@@ -48,6 +48,17 @@ N_CALIBRATION_BINS = 10
 
 
 @dataclass
+class ConfidenceInterval:
+    """95% bootstrap confidence interval for a scalar metric."""
+    estimate: float
+    lower:    float   # 2.5th percentile
+    upper:    float   # 97.5th percentile
+
+    def __str__(self) -> str:
+        return f"{self.estimate:.4f} [{self.lower:.4f}, {self.upper:.4f}]"
+
+
+@dataclass
 class EvaluationReport:
     """Full evaluation results for one model / one set of predictions."""
     n_samples:    int
@@ -70,6 +81,11 @@ class EvaluationReport:
     fn:           int
     tn:           int
 
+    # Bootstrap 95% CIs (None if bootstrap was skipped)
+    ci_auc_roc:     ConfidenceInterval | None = None
+    ci_brier_score: ConfidenceInterval | None = None
+    ci_f1:          ConfidenceInterval | None = None
+
     # Calibration curve data (for plotting)
     calibration_bins: list[dict] = field(default_factory=list)
     # Each dict: {"bin_lower": float, "mean_pred": float, "frac_pos": float, "count": int}
@@ -77,6 +93,102 @@ class EvaluationReport:
     # ROC curve data (for plotting)
     roc_points: list[dict] = field(default_factory=list)
     # Each dict: {"fpr": float, "tpr": float, "threshold": float}
+
+
+# ── Bootstrap CI (defined here so Evaluator.evaluate can reference it) ────────
+
+def _compute_auc_roc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Compute AUC-ROC using the trapezoidal rule.
+
+    We implement this manually to avoid a hard dependency on scikit-learn
+    at inference time. The result matches sklearn.metrics.roc_auc_score.
+    """
+    order  = np.argsort(y_pred)[::-1]
+    y_true = y_true[order]
+
+    n_pos  = y_true.sum()
+    n_neg  = len(y_true) - n_pos
+
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    tpr_list = [0.0]
+    fpr_list = [0.0]
+    tp, fp   = 0.0, 0.0
+
+    for label in y_true:
+        if label == 1:
+            tp += 1
+        else:
+            fp += 1
+        tpr_list.append(tp / n_pos)
+        fpr_list.append(fp / n_neg)
+
+    auc = float(np.trapz(tpr_list, fpr_list))
+    return max(0.0, min(1.0, auc))
+
+
+def _bootstrap_ci(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float,
+    n_iterations: int,
+    seed: int = 42,
+) -> tuple[ConfidenceInterval, ConfidenceInterval, ConfidenceInterval]:
+    """
+    Bootstrap 95% confidence intervals for AUC-ROC, Brier score, and F1.
+
+    Strategy: resample (with replacement) n_iterations times from the test set,
+    compute the metric on each resample, return the 2.5th and 97.5th percentiles.
+
+    Why this works: each resample is a plausible "other test set we might have drawn
+    from the same population." The spread of metric values across resamples
+    estimates how sensitive the metric is to the specific samples we happened to test on.
+
+    With n=80 test samples, expect CI widths of roughly ±0.08 on AUC-ROC.
+    With n=200+ samples, expect ±0.04 or better.
+    """
+    rng = np.random.default_rng(seed)
+    n   = len(y_true)
+
+    aucs, briers, f1s = [], [], []
+
+    for _ in range(n_iterations):
+        idx   = rng.integers(0, n, size=n)
+        yt    = y_true[idx]
+        yp    = y_pred[idx]
+
+        aucs.append(_compute_auc_roc(yt, yp))
+        briers.append(float(np.mean((yp - yt) ** 2)))
+
+        y_bin = (yp >= threshold).astype(np.float32)
+        tp    = float((y_bin * yt).sum())
+        fp    = float((y_bin * (1 - yt)).sum())
+        fn    = float(((1 - y_bin) * yt).sum())
+        prec  = tp / max(tp + fp, 1)
+        rec   = tp / max(tp + fn, 1)
+        f1s.append(2 * prec * rec / max(prec + rec, 1e-9))
+
+    def _ci(values: list[float], estimate: float) -> ConfidenceInterval:
+        arr = np.array(values)
+        return ConfidenceInterval(
+            estimate=round(estimate, 4),
+            lower=round(float(np.percentile(arr, 2.5)), 4),
+            upper=round(float(np.percentile(arr, 97.5)), 4),
+        )
+
+    auc_point   = _compute_auc_roc(y_true, y_pred)
+    brier_point = float(np.mean((y_pred - y_true) ** 2))
+    y_bin       = (y_pred >= threshold).astype(np.float32)
+    tp = float((y_bin * y_true).sum())
+    fp = float((y_bin * (1 - y_true)).sum())
+    fn = float(((1 - y_bin) * y_true).sum())
+    prec = tp / max(tp + fp, 1)
+    rec  = tp / max(tp + fn, 1)
+    f1_point = 2 * prec * rec / max(prec + rec, 1e-9)
+
+    return _ci(aucs, auc_point), _ci(briers, brier_point), _ci(f1s, f1_point)
 
 
 class Evaluator:
@@ -94,6 +206,8 @@ class Evaluator:
         y_true: np.ndarray | list,
         y_pred: np.ndarray | list,
         threshold: float = DEFAULT_THRESHOLD,
+        bootstrap: bool = True,
+        n_bootstrap: int = 1000,
     ) -> EvaluationReport:
         """
         Compute full evaluation metrics.
@@ -102,6 +216,8 @@ class Evaluator:
             y_true: Binary labels (0 or 1). 1 = performed poorly (tilted).
             y_pred: Predicted probabilities in [0, 1].
             threshold: Decision threshold for precision/recall/F1.
+            bootstrap: Whether to compute 95% CI via bootstrap resampling.
+            n_bootstrap: Number of bootstrap iterations (default 1000).
 
         Returns:
             EvaluationReport
@@ -133,6 +249,13 @@ class Evaluator:
         recall    = tp / max(tp + fn, 1)
         f1        = 2 * precision * recall / max(precision + recall, 1e-9)
 
+        # Bootstrap confidence intervals
+        ci_auc, ci_brier, ci_f1 = None, None, None
+        if bootstrap and n_samples >= 20:
+            ci_auc, ci_brier, ci_f1 = _bootstrap_ci(
+                y_true, y_pred, threshold, n_bootstrap
+            )
+
         return EvaluationReport(
             n_samples=n_samples,
             n_positive=n_positive,
@@ -144,6 +267,9 @@ class Evaluator:
             recall=round(recall, 3),
             f1=round(f1, 3),
             tp=tp, fp=fp, fn=fn, tn=tn,
+            ci_auc_roc=ci_auc,
+            ci_brier_score=ci_brier,
+            ci_f1=ci_f1,
             calibration_bins=bins,
             roc_points=roc_points,
         )
@@ -152,21 +278,27 @@ class Evaluator:
     def format_report(report: EvaluationReport) -> str:
         """Human-readable evaluation summary."""
         base_rate = report.n_positive / max(report.n_samples, 1)
+
+        def _ci_str(ci) -> str:
+            return f"  95% CI [{ci.lower:.4f}, {ci.upper:.4f}]" if ci else ""
+
         lines = [
-            "=" * 55,
+            "=" * 60,
             f"EVALUATION REPORT  ({report.n_samples} samples, "
             f"{report.n_positive} positive = {base_rate:.1%} base rate)",
-            "=" * 55,
+            "=" * 60,
             "",
             "  RANKING",
-            f"    AUC-ROC:      {report.auc_roc:.4f}  "
-            + ("★ excellent" if report.auc_roc > 0.80 else
+            f"    AUC-ROC:      {report.auc_roc:.4f}"
+            + _ci_str(report.ci_auc_roc)
+            + "  " + ("★ excellent" if report.auc_roc > 0.80 else
                "✓ good"      if report.auc_roc > 0.70 else
                "~ marginal"  if report.auc_roc > 0.60 else "✗ poor"),
             "",
             "  CALIBRATION",
-            f"    Brier score:  {report.brier_score:.4f}  "
-            + ("★ excellent" if report.brier_score < 0.10 else
+            f"    Brier score:  {report.brier_score:.4f}"
+            + _ci_str(report.ci_brier_score)
+            + "  " + ("★ excellent" if report.brier_score < 0.10 else
                "✓ good"      if report.brier_score < 0.15 else
                "~ marginal"  if report.brier_score < 0.20 else "✗ poor"),
             f"    ECE:          {report.ece:.4f}  "
@@ -177,7 +309,7 @@ class Evaluator:
             f"  THRESHOLD ({report.threshold})",
             f"    Precision:    {report.precision:.3f}",
             f"    Recall:       {report.recall:.3f}",
-            f"    F1:           {report.f1:.3f}",
+            f"    F1:           {report.f1:.3f}" + _ci_str(report.ci_f1),
             f"    TP={report.tp}  FP={report.fp}  FN={report.fn}  TN={report.tn}",
             "",
             "  CALIBRATION CURVE (predicted probability vs actual fraction positive)",
@@ -192,7 +324,7 @@ class Evaluator:
                 f"{b['mean_pred']:>6.3f}  {b['frac_pos']:>7.3f}  "
                 f"{b['count']:>6}  {gap:>6.3f}"
             )
-        lines.append("=" * 55)
+        lines.append("=" * 60)
         return "\n".join(lines)
 
     @staticmethod
@@ -224,40 +356,6 @@ class Evaluator:
 
 
 # ── Internal computation helpers ──────────────────────────────────────────────
-
-def _compute_auc_roc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """
-    Compute AUC-ROC using the trapezoidal rule.
-
-    We implement this manually to avoid a hard dependency on scikit-learn
-    at inference time. The result matches sklearn.metrics.roc_auc_score.
-    """
-    # Sort by predicted probability descending
-    order  = np.argsort(y_pred)[::-1]
-    y_true = y_true[order]
-
-    n_pos  = y_true.sum()
-    n_neg  = len(y_true) - n_pos
-
-    if n_pos == 0 or n_neg == 0:
-        return 0.5   # undefined — return chance level
-
-    tpr_list = [0.0]
-    fpr_list = [0.0]
-    tp, fp   = 0.0, 0.0
-
-    for label in y_true:
-        if label == 1:
-            tp += 1
-        else:
-            fp += 1
-        tpr_list.append(tp / n_pos)
-        fpr_list.append(fp / n_neg)
-
-    # Trapezoidal AUC
-    auc = float(np.trapz(tpr_list, fpr_list))
-    return max(0.0, min(1.0, auc))
-
 
 def _compute_roc_curve(y_true: np.ndarray, y_pred: np.ndarray, n_points: int = 50) -> list[dict]:
     """Return sampled (fpr, tpr, threshold) triples for plotting."""

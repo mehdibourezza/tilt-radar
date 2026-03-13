@@ -284,5 +284,9 @@ class TiltPredictionLog(Base):
     feature_vector_at_peak: Mapped[list | None] = mapped_column(JSON)
     # n_signals_active: number of signals active at peak (convenience column for queries)
     n_signals_active: Mapped[int | None] = mapped_column(Integer)
+    # snapshot_sequence: full game trajectory of feature vectors for GRU training.
+    # JSON list of {"feature_vector": [...26 floats], "game_time": float} entries,
+    # one per 5-second polling interval. Shape at training time: (T, 26).
+    snapshot_sequence: Mapped[str | None] = mapped_column(Text)
 
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

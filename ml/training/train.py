@@ -26,7 +26,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -162,6 +164,23 @@ def run_snapshot_scorer(dataset) -> None:
 
     logger.info(split.summary() if hasattr(split, 'summary') else "Split complete")
 
+    # Carve off the last ~14% of training data as a dedicated Platt calibration set.
+    # This prevents calibration from reusing the val set (which influenced n_estimators
+    # via early stopping) — that would make calibrated probabilities overconfident.
+    n_train_total = split.train.n_samples
+    n_cal = max(1, int(n_train_total * 0.143))  # ~10% of all data
+    n_train_actual = n_train_total - n_cal
+
+    X_train_actual = split.train.X[:n_train_actual]
+    y_train_actual = split.train.y[:n_train_actual]
+    X_cal = split.train.X[n_train_actual:]
+    y_cal = split.train.y[n_train_actual:]
+
+    logger.info(
+        f"Data split: train={n_train_actual}, cal={n_cal}, "
+        f"val={split.val.n_samples}, test={split.test.n_samples}"
+    )
+
     try:
         scorer = SnapshotScorer()
     except ImportError as e:
@@ -170,8 +189,9 @@ def run_snapshot_scorer(dataset) -> None:
 
     # Train
     metrics = scorer.train(
-        split.train.X, split.train.y,
-        split.val.X,   split.val.y,
+        X_train_actual, y_train_actual,
+        split.val.X,    split.val.y,
+        X_cal,          y_cal,
     )
     logger.info(f"Training metrics: {metrics}")
 
@@ -185,6 +205,12 @@ def run_snapshot_scorer(dataset) -> None:
     # Save model
     model_path = EXPERIMENTS_DIR / "snapshot_scorer.pkl"
     scorer.save(model_path)
+
+    # Save timestamped version for rollback
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    versioned_path = EXPERIMENTS_DIR / f"snapshot_scorer_{ts}.pkl"
+    shutil.copy(model_path, versioned_path)
+    logger.info(f"Versioned model saved to {versioned_path}")
 
     # Save report
     report_path = EXPERIMENTS_DIR / "snapshot_scorer_eval.txt"
@@ -204,7 +230,7 @@ def run_temporal_model(records: list[dict]) -> None:
     logger.info("=" * 60)
 
     try:
-        sequences, labels = build_sequence_dataset(records)
+        sequences, label_sequences = build_sequence_dataset(records)
     except NotImplementedError as e:
         logger.warning(str(e))
         return
@@ -231,9 +257,9 @@ def run_temporal_model(records: list[dict]) -> None:
     train_seq = sequences[:n_train]
     val_seq   = sequences[n_train:n_train + n_val]
     test_seq  = sequences[n_train + n_val:]
-    train_lbl = labels[:n_train]
-    val_lbl   = labels[n_train:n_train + n_val]
-    test_lbl  = labels[n_train + n_val:]
+    train_lbl = label_sequences[:n_train]
+    val_lbl   = label_sequences[n_train:n_train + n_val]
+    test_lbl  = label_sequences[n_train + n_val:]
 
     model   = TemporalTiltModel()
     history = model.train(train_seq, train_lbl, val_seq, val_lbl)
@@ -244,12 +270,13 @@ def run_temporal_model(records: list[dict]) -> None:
         + (f", val_loss={history['val_loss'][-1]:.4f}" if history.get("val_loss") else "")
     )
 
-    # Evaluate: use last-step prediction for each test sequence
+    # Evaluate on test set: last-step prediction vs last-step label
+    # (last label is 1.0 for tilt games at/after peak, 0.0 for clean games)
     y_pred = np.array([
         model.predict_proba_sequence(seq)[-1]
         for seq in test_seq
     ])
-    y_true = np.array(test_lbl, dtype=np.float32)
+    y_true = np.array([lbl[-1] for lbl in test_lbl], dtype=np.float32)
 
     evaluator = Evaluator()
     report    = evaluator.evaluate(y_true, y_pred)
@@ -258,6 +285,12 @@ def run_temporal_model(records: list[dict]) -> None:
     # Save
     model_path = EXPERIMENTS_DIR / "temporal_model.pt"
     model.save(model_path)
+
+    # Save timestamped version for rollback
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    versioned_path = EXPERIMENTS_DIR / f"temporal_model_{ts}.pt"
+    shutil.copy(model_path, versioned_path)
+    logger.info(f"Versioned model saved to {versioned_path}")
 
     report_path = EXPERIMENTS_DIR / "temporal_model_eval.txt"
     report_path.write_text(evaluator.format_report(report))

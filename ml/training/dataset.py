@@ -324,23 +324,48 @@ def temporal_split(
 def build_sequence_dataset(
     records: list[dict],
     group_by: str = "game_session",
-) -> tuple[list[np.ndarray], list[int]]:
+    ramp_start_fraction: float = 0.60,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """
-    Build per-game sequences of feature vectors for GRU training.
+    Build per-game sequences of feature vectors for GRU training, with
+    per-timestep ramp labels derived from game_time_at_peak (Option B labeling).
 
     NOTE: This requires the snapshot_sequence column (Phase D) which is not
     yet populated. This function is a placeholder that will be activated
     when that column is available.
 
-    For now, it raises NotImplementedError to clearly communicate the
-    dependency.
+    === OPTION B RAMP LABELS ===
+
+    Last-state supervision (the naive approach) labels EVERY snapshot in a game
+    with the final game outcome. So a snapshot at minute 1 with no evidence of
+    tilt gets labeled 1.0 just because the game ended badly. This adds noise and
+    makes the GRU predict tilt before any evidence exists.
+
+    Option B uses game_time_at_peak as a timing anchor:
+
+      t < 0.6 * peak_time  →  label = 0.0   (definitely not tilted yet)
+      t in [60%, 100%] of peak_time  →  linear ramp 0.0 → 1.0
+      t >= peak_time  →  label = 1.0   (peak tilt confirmed)
+
+    For non-tilt games (performed_poorly=False): all labels = 0.0
+    For tilt games with no peak_time recorded: falls back to last-state (label 1.0
+    at final timestep only), which is conservative but unambiguous.
+
+    snapshot_sequence format expected per record:
+      [{"feature_vector": [f0, f1, ...], "game_time": 42.5}, ...]
 
     Args:
         records: TiltPredictionLog records
-        group_by: "game_session" — group by match/session
+        group_by: reserved for future use (currently all records treated individually)
+        ramp_start_fraction: when tilt starts building as a fraction of peak_time.
+                             Default 0.60 is conservative but arbitrary — validate
+                             empirically once enough data with timestamped tilt peaks
+                             is available.
 
     Returns:
-        (sequences, labels) where sequences[i] has shape (T_i, FEATURE_DIM)
+        (sequences, label_sequences)
+          sequences[i]:       np.ndarray shape (T_i, FEATURE_DIM)
+          label_sequences[i]: np.ndarray shape (T_i,) with values in [0.0, 1.0]
     """
     eligible = [r for r in records if r.get("snapshot_sequence") is not None]
     if not eligible:
@@ -351,22 +376,83 @@ def build_sequence_dataset(
         )
 
     from ml.features.feature_extractor import FEATURE_DIM
-    sequences: list[np.ndarray] = []
-    labels:    list[int]        = []
+    sequences:       list[np.ndarray] = []
+    label_sequences: list[np.ndarray] = []
 
     for record in eligible:
         seq_data = record["snapshot_sequence"]
         if isinstance(seq_data, str):
             seq_data = json.loads(seq_data)
-        seq = np.array(seq_data, dtype=np.float32)   # (T, FEATURE_DIM)
-        if seq.shape[1] != FEATURE_DIM:
+
+        # seq_data is a list of dicts: [{feature_vector: [...], game_time: float}, ...]
+        # Support both the new dict format and the old flat array format for compatibility.
+        if seq_data and isinstance(seq_data[0], dict):
+            feature_vecs = [s["feature_vector"] for s in seq_data]
+            timestamps   = [float(s.get("game_time", i * 5)) for i, s in enumerate(seq_data)]
+        else:
+            # Legacy: flat list of feature vectors (no timestamps) — use 5s intervals
+            feature_vecs = seq_data
+            timestamps   = [i * 5.0 for i in range(len(seq_data))]
+
+        seq = np.array(feature_vecs, dtype=np.float32)
+        if seq.ndim != 2 or seq.shape[1] != FEATURE_DIM:
             logger.warning(f"Skipping record {record.get('id')}: shape mismatch {seq.shape}")
             continue
-        sequences.append(seq)
-        labels.append(1 if record.get("performed_poorly", False) else 0)
 
-    logger.info(f"Built {len(sequences)} game sequences for GRU training")
-    return sequences, labels
+        performed_poorly = bool(record.get("performed_poorly", False))
+        peak_time        = record.get("game_time_at_peak")
+        ramp             = _ramp_labels(timestamps, peak_time, performed_poorly, ramp_start_fraction)
+
+        sequences.append(seq)
+        label_sequences.append(ramp)
+
+    n_tilt = sum(1 for lbl in label_sequences if lbl[-1] > 0.5)
+    logger.info(
+        f"Built {len(sequences)} game sequences for GRU training "
+        f"({n_tilt} tilt, {len(sequences) - n_tilt} non-tilt)"
+    )
+    return sequences, label_sequences
+
+
+def _ramp_labels(
+    timestamps: list[float],
+    peak_time: float | None,
+    performed_poorly: bool,
+    ramp_start_fraction: float = 0.60,
+) -> np.ndarray:
+    """
+    Compute per-timestep ramp labels for one game sequence.
+
+    For non-tilt games: all zeros.
+    For tilt games with a known peak_time:
+      - Before 60% of peak_time: 0.0
+      - 60–100% of peak_time: linear ramp 0.0 → 1.0
+      - At or after peak_time: 1.0
+    For tilt games with no peak_time: conservative last-step label only.
+    """
+    T      = len(timestamps)
+    labels = np.zeros(T, dtype=np.float32)
+
+    if not performed_poorly:
+        return labels  # all zeros — clean game
+
+    if peak_time is None or peak_time <= 0:
+        # Fallback: we know the game went badly but not when peak tilt was.
+        # Put label 1.0 only at the final snapshot — conservative, unambiguous.
+        labels[-1] = 1.0
+        return labels
+
+    ramp_start = peak_time * ramp_start_fraction
+    ramp_width = peak_time - ramp_start  # always > 0 since peak_time > 0
+
+    for i, t in enumerate(timestamps):
+        if t >= peak_time:
+            labels[i] = 1.0
+        elif t >= ramp_start:
+            labels[i] = (t - ramp_start) / ramp_width
+        # else: 0.0 (before tilt evidence starts)
+
+    return labels
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
