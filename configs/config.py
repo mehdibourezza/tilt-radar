@@ -1,3 +1,6 @@
+import secrets
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
@@ -39,6 +42,41 @@ class Settings(BaseSettings):
     # Riot API rate limits (development key defaults)
     riot_rate_limit_per_second: int = 20
     riot_rate_limit_per_two_minutes: int = 100
+
+    # -----------------------------------------------------------------------
+    # Validators — reject insecure defaults in production
+    # -----------------------------------------------------------------------
+
+    @field_validator("riot_api_key")
+    @classmethod
+    def riot_key_must_be_set(cls, v: str) -> str:
+        placeholder = {"", "your-key-here", "RGAPI-your-key-here"}
+        if v.strip() in placeholder:
+            raise ValueError(
+                "RIOT_API_KEY must be set to a real Riot API key in .env"
+            )
+        return v.strip()
+
+    @field_validator("secret_key")
+    @classmethod
+    def secret_key_not_default_in_prod(cls, v: str, info) -> str:
+        env = info.data.get("app_env", "development")
+        if env == "production" and v in ("change-me", "change-me-in-production", ""):
+            raise ValueError(
+                "SECRET_KEY must be changed from its default in production. "
+                f"Suggestion: SECRET_KEY={secrets.token_urlsafe(32)}"
+            )
+        return v
+
+    @field_validator("postgres_password")
+    @classmethod
+    def db_password_not_default_in_prod(cls, v: str, info) -> str:
+        env = info.data.get("app_env", "development")
+        if env == "production" and v == "postgres":
+            raise ValueError(
+                "POSTGRES_PASSWORD must be changed from default 'postgres' in production"
+            )
+        return v
 
     @property
     def postgres_url(self) -> str:

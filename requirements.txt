@@ -29,6 +29,9 @@ scipy==1.14.1
 # Experiment tracking
 wandb==0.18.3
 
+# Rate limiting
+slowapi==0.1.9
+
 # Monitoring
 prometheus-fastapi-instrumentator==7.0.0
 

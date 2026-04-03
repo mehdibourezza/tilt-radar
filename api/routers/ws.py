@@ -4,21 +4,39 @@ WebSocket endpoint for real-time tilt analysis.
 Flow:
   1. Agent connects: ws/game/{summoner}/{tag}
   2. Backend looks up the active game via Riot Spectator API
-     → identifies all 10 participants → fetches baselines from DB
+     -> identifies all 10 participants -> fetches baselines from DB
   3. For each snapshot the agent sends:
-     → run tilt inference on all 10 players
-     → send back a tilt report JSON
-     → track peak tilt scores per player for post-game evaluation
+     -> run tilt inference on all 10 players
+     -> send back a tilt report JSON
+     -> track peak tilt scores per player for post-game evaluation
   4. On game_over:
-     → compare peak predictions against final scoreboard outcomes
-     → log TiltPredictionLog records (labeled training data for the ML model)
-     → queue Celery ingestion for self + all 9 others
+     -> compare peak predictions against final scoreboard outcomes
+     -> log TiltPredictionLog records (labeled training data for the ML model)
+     -> queue Celery ingestion for self + all 9 others
+
+Security:
+  - Path params validated via api.schemas.validation
+  - Every WebSocket message is size-checked (MAX_MESSAGE_BYTES)
+  - JSON payloads are validated against Pydantic schemas before processing
+  - Per-IP connection rate limiting prevents resource exhaustion
+  - Receive timeout prevents idle connections from lingering
 """
 
+import asyncio
 import json
 import logging
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+import time
+from collections import defaultdict
 
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
+
+from api.schemas.validation import (
+    validate_summoner_name,
+    validate_tag,
+    GameSnapshot,
+    GameOverSnapshot,
+)
 from data.riot.client import RiotClient
 from data.db.repository import PlayerRepository
 from ml.inference.engine import TiltInferenceEngine
@@ -31,8 +49,55 @@ from workers.tasks import ingest_player
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# ---------------------------------------------------------------------------
+# Security constants
+# ---------------------------------------------------------------------------
+MAX_MESSAGE_BYTES = 100 * 1024     # 100 KB — one snapshot is typically ~5 KB
+RECEIVE_TIMEOUT_S = 60.0           # close idle connections after 60s of silence
+MAX_CONNECTIONS_PER_IP = 5         # max concurrent WebSocket connections per IP
+CONNECTION_WINDOW_S = 60.0         # time window for connection rate limiting
+MAX_CONNECTS_PER_WINDOW = 10       # max new connections per IP per window
+
 # Tilt threshold for "predicted tilted" in the post-game verdict
 PREDICTION_THRESHOLD = 0.55
+
+
+# ---------------------------------------------------------------------------
+# Per-IP connection tracker (prevents DoS via connection flooding)
+# ---------------------------------------------------------------------------
+class ConnectionTracker:
+    """Track active WebSocket connections and connection rate per IP."""
+
+    def __init__(self):
+        self._active: dict[str, int] = defaultdict(int)       # IP -> active count
+        self._recent: dict[str, list[float]] = defaultdict(list)  # IP -> timestamps
+
+    def can_connect(self, ip: str) -> tuple[bool, str]:
+        """Check if a new connection from this IP is allowed."""
+        # Check concurrent connection limit
+        if self._active[ip] >= MAX_CONNECTIONS_PER_IP:
+            return False, "Too many concurrent connections from this IP"
+
+        # Check connection rate limit (sliding window)
+        now = time.monotonic()
+        recent = [t for t in self._recent[ip] if now - t < CONNECTION_WINDOW_S]
+        self._recent[ip] = recent
+        if len(recent) >= MAX_CONNECTS_PER_WINDOW:
+            return False, "Connection rate limit exceeded — try again later"
+
+        return True, ""
+
+    def connect(self, ip: str):
+        self._active[ip] += 1
+        self._recent[ip].append(time.monotonic())
+
+    def disconnect(self, ip: str):
+        self._active[ip] = max(0, self._active[ip] - 1)
+        if self._active[ip] == 0:
+            self._active.pop(ip, None)
+
+
+_tracker = ConnectionTracker()
 
 
 def _evaluate_outcome(
@@ -54,10 +119,10 @@ def _evaluate_outcome(
         (if peer baseline available) or rough heuristics (if not)
       - "predicted_tilted" = peak_score >= PREDICTION_THRESHOLD
 
-      true_positive:  predicted AND performed poorly  → signal was real
-      false_positive: predicted BUT performed fine    → we over-triggered
-      true_negative:  not predicted AND performed fine → correct silence
-      false_negative: not predicted BUT performed poorly → we missed it
+      true_positive:  predicted AND performed poorly  -> signal was real
+      false_positive: predicted BUT performed fine    -> we over-triggered
+      true_negative:  not predicted AND performed fine -> correct silence
+      false_negative: not predicted BUT performed poorly -> we missed it
     """
     deaths = final_player.get("deaths", 0)
     cs = final_player.get("cs", 0)
@@ -117,8 +182,25 @@ def _evaluate_outcome(
 
 @router.websocket("/ws/game/{summoner}/{tag}")
 async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
+    # --- Validate path parameters before accepting the connection ---
+    try:
+        summoner = validate_summoner_name(summoner)
+        tag = validate_tag(tag)
+    except ValueError as e:
+        await websocket.close(code=1008, reason=str(e))
+        return
+
+    # --- Per-IP connection rate limiting ---
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    allowed, reason = _tracker.can_connect(client_ip)
+    if not allowed:
+        logger.warning(f"Connection refused for {client_ip}: {reason}")
+        await websocket.close(code=1008, reason=reason)
+        return
+
+    _tracker.connect(client_ip)
     await websocket.accept()
-    logger.info(f"Agent connected for {summoner}#{tag}")
+    logger.info(f"Agent connected for {summoner}#{tag} from {client_ip}")
 
     engine    = TiltInferenceEngine()
     extractor = FeatureExtractor()
@@ -170,8 +252,8 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
             # Step 3 — fetch baselines for all 10 players
             async for session in get_db_session():
                 repo = PlayerRepository(session)
-                personal_baselines = {}   # puuid → PlayerBaseline  (self only, if ingested)
-                peer_baselines = {}       # puuid → PeerGroupBaseline (all 9 non-self + self fallback)
+                personal_baselines = {}   # puuid -> PlayerBaseline  (self only, if ingested)
+                peer_baselines = {}       # puuid -> PeerGroupBaseline (all 9 non-self + self fallback)
 
                 # Self: personal baseline first, peer as fallback
                 self_baseline = await repo.get_baseline(puuid)
@@ -218,25 +300,48 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
             })
 
             # Step 4 — main loop: receive snapshots, score, track peaks
-            # peak_scores: {summoner_name → {score, tilt_type, signals, champion, role,
-            #                                game_time_at_peak, feature_vector}}
             peak_scores: dict[str, dict] = {}
-            # recorders: accumulate full game feature vector trajectory per player
-            # for GRU training data (saved to snapshot_sequence at game_over)
             recorders: dict[str, GameSequenceRecorder] = {}
-            # Retained for post-game report: last full snapshot + item sell timeline
             backend_last_snapshot: dict | None = None
-            item_sell_timeline: dict[str, list] = {}   # {summoner → [{time, items}]}
+            item_sell_timeline: dict[str, list] = {}
 
             while True:
-                raw = await websocket.receive_text()
-                snapshot = json.loads(raw)
+                # --- Receive with timeout + size check ---
+                try:
+                    raw = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=RECEIVE_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(f"WebSocket timeout for {summoner}#{tag} — closing")
+                    await websocket.close(code=1000, reason="Idle timeout")
+                    break
 
-                # Game over — build report, run evaluation, queue ingestion
-                if snapshot.get("event") == "game_over":
+                if len(raw.encode("utf-8")) > MAX_MESSAGE_BYTES:
+                    await websocket.send_json({
+                        "error": f"Message too large ({len(raw.encode('utf-8'))} bytes, max {MAX_MESSAGE_BYTES})"
+                    })
+                    continue  # drop oversized message, don't kill connection
+
+                # --- Parse JSON ---
+                try:
+                    raw_snapshot = json.loads(raw)
+                except json.JSONDecodeError:
+                    await websocket.send_json({"error": "Invalid JSON"})
+                    continue
+
+                # --- Game over — validate with GameOverSnapshot schema ---
+                if raw_snapshot.get("event") == "game_over":
+                    try:
+                        validated = GameOverSnapshot(**raw_snapshot)
+                    except ValidationError as e:
+                        await websocket.send_json({"error": f"Invalid game_over payload: {e.error_count()} errors"})
+                        continue
+
                     logger.info(f"Game over for {summoner}#{tag}")
-                    final_players = snapshot.get("final_players", [])
-                    game_duration_min = snapshot.get("game_duration_min", 30.0)
+                    # Convert validated model back to dict for existing logic
+                    final_players = [p.model_dump() for p in validated.final_players]
+                    game_duration_min = validated.game_duration_min
 
                     # Send post-game report to agent before any async DB work
                     post_game_report = _build_post_game_report(
@@ -259,7 +364,6 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                         peer_baselines, snapshot_sequences,
                     )
 
-                    # Reset snapshot buffer for next game session
                     buffer.clear()
 
                     # Queue async ingestion for self + all others
@@ -268,24 +372,35 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                         ingest_player.delay(ep, platform="euw1")
                     break
 
+                # --- Regular snapshot — validate with GameSnapshot schema ---
+                try:
+                    validated = GameSnapshot(**raw_snapshot)
+                except ValidationError as e:
+                    await websocket.send_json({"error": f"Invalid snapshot: {e.error_count()} errors"})
+                    continue
+
+                # Convert validated models to dicts for the existing inference engine
+                snapshot = {
+                    "game_time": validated.game_time,
+                    "players": [p.model_dump() for p in validated.players],
+                    "events": [e.model_dump() for e in validated.events],
+                }
+
                 # One-shot debug: on first snapshot that has kill events, log raw names
-                # to check for mismatches between player names and kill event names
-                kill_events_raw = [e for e in snapshot.get("events", []) if e.get("type") == "ChampionKill"]
+                kill_events_raw = [e for e in snapshot["events"] if e.get("type") == "ChampionKill"]
                 if kill_events_raw and not peak_scores.get("__debug_logged__"):
                     peak_scores["__debug_logged__"] = True
-                    player_names = [p["summonerName"] for p in snapshot.get("players", [])]
+                    player_names = [p["summonerName"] for p in snapshot["players"]]
                     sample = [{"killer": e.get("killer"), "victim": e.get("victim")} for e in kill_events_raw[:3]]
                     logger.info(f"DEBUG names in players list: {player_names}")
                     logger.info(f"DEBUG kill event names (sample): {sample}")
 
                 report    = engine.score(snapshot, personal_baselines, peer_baselines)
-                game_time = snapshot.get("game_time", 0)
-                all_players = snapshot.get("players", [])
-                kill_events = [e for e in snapshot.get("events", []) if e.get("type") == "ChampionKill"]
+                game_time = snapshot["game_time"]
+                all_players = snapshot["players"]
+                kill_events = [e for e in snapshot["events"] if e.get("type") == "ChampionKill"]
 
-                # ── Feature extraction (Phase A ML pipeline) ──────────────────
-                # Update buffer first so history is available for delta features.
-                # Then extract the feature vector for each player.
+                # -- Feature extraction (Phase A ML pipeline) --
                 for player in all_players:
                     buffer.update(game_time, player)
 
@@ -307,14 +422,13 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                             history=history,
                         )
                         player_features[pname] = fv.to_list()
-                        # Accumulate full game trajectory for GRU training
                         recorders.setdefault(
                             pname, GameSequenceRecorder(player_name=pname)
                         ).record(fv.vector, game_time)
                     except Exception as exc:
                         logger.warning(f"Feature extraction failed for {pname}: {exc}")
 
-                # Log a compact score summary every snapshot so we can debug in real time
+                # Log a compact score summary every snapshot
                 game_fmt = report.get("game_time_fmt", "?")
                 tilted = [
                     f"{r['summonerName']}({r['player_type'][0].upper()})={r['tilt_score']:.2f}"
@@ -326,12 +440,11 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
                 else:
                     logger.info(f"[{game_fmt}] All scores 0.00 — no signals triggered")
 
-                # Update peak tilt scores — now also captures role, game_time, feature_vector
+                # Update peak tilt scores
                 for player_result in report.get("players", []):
                     name  = player_result["summonerName"]
                     score = player_result["tilt_score"]
                     if score > peak_scores.get(name, {}).get("score", 0.0):
-                        # Find position from the raw player dict
                         raw_player = next(
                             (p for p in all_players if p.get("summonerName") == name), {}
                         )
@@ -351,7 +464,7 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
 
                 # Retain last snapshot for post-game report; track item sell timing
                 backend_last_snapshot = snapshot
-                for player in snapshot.get("players", []):
+                for player in snapshot["players"]:
                     sold = player.get("sold_items", [])
                     if sold:
                         item_sell_timeline.setdefault(player["summonerName"], []).append({
@@ -361,9 +474,14 @@ async def game_websocket(websocket: WebSocket, summoner: str, tag: str):
 
     except WebSocketDisconnect:
         logger.info(f"Agent disconnected for {summoner}#{tag}")
-    except Exception as e:
-        logger.exception(f"Error in WebSocket handler: {e}")
-        await websocket.close()
+    except Exception:
+        logger.exception(f"Error in WebSocket handler for {summoner}#{tag}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass  # connection may already be closed
+    finally:
+        _tracker.disconnect(client_ip)
 
 
 async def _run_post_game_evaluation(
@@ -447,7 +565,7 @@ async def _run_post_game_evaluation(
     # Highlight the most interesting cases
     for e in sorted(entries, key=lambda x: x["peak_tilt_score"], reverse=True):
         if e["verdict"] in ("true_positive", "false_positive"):
-            icon = "✓" if e["verdict"] == "true_positive" else "✗"
+            icon = "+" if e["verdict"] == "true_positive" else "-"
             logger.info(
                 f"  [{icon}] {e['player_type'].upper()} {e['player_name']} ({e['champion_name']}) — "
                 f"peak={e['peak_tilt_score']:.0%}, {e['verdict']}, "
@@ -500,7 +618,7 @@ def _build_post_game_report(
         tilt_type   = peak["tilt_type"] if peak else "none"
         key_signals = peak["signals"]   if peak else []
 
-        # ── Final stats ────────────────────────────────────────────────────────
+        # -- Final stats --
         kills      = player.get("kills", 0)
         deaths     = player.get("deaths", 0)
         assists    = player.get("assists", 0)
@@ -517,7 +635,7 @@ def _build_post_game_report(
             "kda":          round((kills + assists) / max(deaths, 1), 2),
         }
 
-        # ── Timeline ───────────────────────────────────────────────────────────
+        # -- Timeline --
         timeline = []
 
         # Deaths — annotated with repeat-killer and death-streak detection
@@ -540,10 +658,10 @@ def _build_post_game_report(
                 note     = " — 2nd death to same enemy"
                 severity = "medium"
             elif count == 3:
-                note     = " — 3rd death to same enemy ⚠ PRIDE SIGNAL"
+                note     = " — 3rd death to same enemy -- PRIDE SIGNAL"
                 severity = "high"
             elif count > 3:
-                note     = f" — {count}th death to same enemy ⚠"
+                note     = f" — {count}th death to same enemy --"
                 severity = "high"
 
             if i >= 2 and t - deaths_list[i - 2].get("time", 0) <= 180:
@@ -567,7 +685,7 @@ def _build_post_game_report(
                 "time_fmt": f"{int(t // 60)}:{int(t % 60):02d}",
                 "type":     "item_sell",
                 "severity": "high" if len(sold) >= 2 else "medium",
-                "detail":   f"Sold {len(sold)} item(s) ⚠ tilt behavior",
+                "detail":   f"Sold {len(sold)} item(s) -- tilt behavior",
             })
 
         # Objective absence — each drake/baron the team took without this player

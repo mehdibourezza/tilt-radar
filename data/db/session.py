@@ -29,6 +29,8 @@ engine = create_async_engine(
     settings.postgres_url,
     pool_size=10,
     max_overflow=20,
+    pool_pre_ping=True,         # detect stale connections before use
+    pool_recycle=3600,          # recycle connections every hour
     echo=settings.app_env == "development",
 )
 
