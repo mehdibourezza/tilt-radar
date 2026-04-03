@@ -8,48 +8,19 @@ TiltRadar is an ML-powered system that detects when players in online competitiv
 
 ## How It Works
 
-```
-LOCAL MACHINE                                  BACKEND SERVER
-                                              
-League of Legends                             FastAPI + WebSocket
-      |                                             |
-  Live Client API (port 2999)                 Tilt Inference Engine
-      |                                        |            |
-  Local Agent ---- WebSocket (5s) ------->  12 Behavioral   26D Feature
-      |                                     Signals         Extraction
-  In-Game Overlay                              |            |
-  (tilt alerts +                           Tilt Score    XGBoost +
-   exploit tips)                           [0 - 1]      GRU Temporal
-      |                                        |            |
-  Post-Game Report  <---- JSON -----------  Evaluation + Labeled Data
-                                                    |
-                                              PostgreSQL + Redis/Celery
-                                              (baselines, ingestion)
-```
+A **local agent** runs alongside the game and reads its state every 5 seconds through the game's local API. Each snapshot (player stats, kills, items, objectives) is streamed over a **WebSocket** to the backend server.
 
-### Detection Pipeline
+The backend runs each snapshot through four stages:
 
-1. **Signal Extraction** -- 12 composite behavioral indicators scored every 5 seconds:
-   - Repeat deaths to the same opponent (pride/fixation)
-   - Death rate acceleration over time
-   - CS (farm) performance drop vs personal baseline
-   - Kill participation decline (disengagement)
-   - Item sells mid-game (rage indicator)
-   - Objective absence, vision neglect, level/gold deficits, and more
+> **1. Signal Extraction** -- 12 behavioral indicators are scored in real time: repeat deaths to the same opponent (fixation), death rate acceleration, farm performance dropping below personal baseline, declining team participation, rage item sells, objective absence, and more.
+>
+> **2. Feature Engineering** -- Raw signals + player baselines are converted into a **26-dimensional normalized vector**. Baselines are computed using **PELT change-point detection** on the player's last 100 games, isolating their latest stable performance segment rather than averaging over stale history.
+>
+> **3. ML Scoring** -- The feature vector is scored by an **XGBoost snapshot classifier**, then fed into a **stateful GRU temporal model** (PyTorch) that tracks sequences of 6-24 snapshots. The GRU maintains hidden state across snapshots, so inference is O(1) per tick and runs in **<10ms on CPU**.
+>
+> **4. Self-Labeling** -- After the game ends, peak predictions are compared against final scoreboard outcomes to automatically generate labeled training data (true/false positives and negatives). No manual annotation is needed -- every game improves the next model.
 
-2. **ML Scoring** -- 3-stage pipeline:
-   - **Feature Extractor**: converts raw game state + baselines into a 26-dimensional normalized vector
-   - **XGBoost Snapshot Scorer**: classifies single-snapshot tilt likelihood
-   - **GRU Temporal Model** (PyTorch): processes sequences of 6-24 snapshots with stateful hidden state, runs inference in <10ms on CPU
-
-3. **Baseline Normalization** -- compares each player against their own history:
-   - **PELT change-point detection** on 100-game histories to find the latest stable performance segment
-   - Falls back to rank-tier peer group aggregates when personal data is unavailable
-
-4. **Self-Labeling Loop** -- no manual annotation needed:
-   - Post-game: compares peak in-game tilt predictions against final scoreboard outcomes
-   - Generates `true_positive` / `false_positive` / `true_negative` / `false_negative` labels automatically
-   - Each game produces labeled training data for the next model iteration
+Tilt scores and recommendations are sent back to the agent, which displays them through a **real-time in-game overlay**. In the background, **Celery workers** ingest match histories for all 10 players via the Riot API, building the baseline database for future games.
 
 ---
 
